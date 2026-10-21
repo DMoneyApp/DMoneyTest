@@ -2300,6 +2300,10 @@
     });
   }
 
+  // Expose the Android-storage snapshot restorer for the separate Google Drive module.
+  // The Drive module runs in its own closure and otherwise cannot access this function.
+  window.restoreAndroidStorageSnapshot = restoreAndroidStorageSnapshot;
+
   var WBT = {
     openAnalysis:function(){state.tab='analysis';state.view='goalsList';state.activeGoalId=null;state.activeCommitmentId=null;state.goalsSubtab=(state.goalsSubtab||'financial');state.showTxForm=false;state.utility='';state.showMenu=false;state.showSearch=false;state.showAccountPicker=false;render();},
     goHome: function () { state.tab='transactions'; state.view='log'; state.period='month'; state.periodValue=monthOf(todayStr()); state.activeGoalId=null; state.activeCommitmentId=null; state.showMenu=false; state.showSearch=false; state.showAccountPicker=false; state.showCarryYearPicker=false; state.utility=''; state.showTxForm=false; render(); },
