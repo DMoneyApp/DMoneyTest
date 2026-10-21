@@ -2212,6 +2212,94 @@
     document.body.insertAdjacentHTML('beforeend',html);
     setTimeout(function(){var el=document.getElementById('editAcctTypeName');if(el){el.focus();try{el.setSelectionRange(el.value.length,el.value.length);}catch(e){}}},0);
   }
+  function verifyAndroidStorageSnapshot(backup) {
+    return new Promise(function (resolve, reject) {
+      if (!backup || backup.format !== 'dmoney-web-storage' || !backup.entries || typeof backup.entries !== 'object' || Array.isArray(backup.entries)) {
+        reject(new Error('This is not a DMoney Android APK storage backup.'));
+        return;
+      }
+      var entries = backup.entries, keys = Object.keys(entries), raw = entries[STORAGE_KEY], appData;
+      if (!keys.length || keys.length > 200 || typeof raw !== 'string') {
+        reject(new Error('The APK backup is missing the DMoney profile data.'));
+        return;
+      }
+      try { appData = JSON.parse(raw); } catch (e) {
+        reject(new Error('The APK backup profile data is damaged.'));
+        return;
+      }
+      if (!appData || !Array.isArray(appData.profiles) || !appData.profiles.length) {
+        reject(new Error('The APK backup does not contain any DMoney profiles.'));
+        return;
+      }
+      var total = 0;
+      for (var i = 0; i < keys.length; i++) {
+        if (typeof entries[keys[i]] !== 'string' || !keys[i] || keys[i].length > 200) {
+          reject(new Error('The APK backup contains an invalid storage entry.'));
+          return;
+        }
+        total += (keys[i].length + entries[keys[i]].length) * 2;
+        if (total > 4 * 1024 * 1024) {
+          reject(new Error('The APK backup is too large for safe browser storage.'));
+          return;
+        }
+      }
+      if (!backup.sha256) { resolve(backup); return; }
+      if (!window.crypto || !window.crypto.subtle || typeof TextEncoder === 'undefined') {
+        reject(new Error('This browser cannot verify the APK backup integrity checksum.'));
+        return;
+      }
+      try {
+        keys.sort();
+        var encoder = new TextEncoder(), chunks = [], byteLength = 0;
+        keys.forEach(function (key) {
+          var k = encoder.encode(key), v = encoder.encode(String(entries[key]));
+          var zero = new Uint8Array([0]), one = new Uint8Array([1]);
+          chunks.push(k, zero, v, one);
+          byteLength += k.length + 1 + v.length + 1;
+        });
+        var bytes = new Uint8Array(byteLength), offset = 0;
+        chunks.forEach(function (part) { bytes.set(part, offset); offset += part.length; });
+        window.crypto.subtle.digest('SHA-256', bytes.buffer).then(function (digest) {
+          var hex = Array.prototype.map.call(new Uint8Array(digest), function (b) { return b.toString(16).padStart(2, '0'); }).join('');
+          if (hex.toLowerCase() !== String(backup.sha256).toLowerCase()) {
+            reject(new Error('APK backup integrity check failed. No data was changed.'));
+          } else resolve(backup);
+        }).catch(function () { reject(new Error('Could not verify the APK backup checksum. No data was changed.')); });
+      } catch (e) { reject(new Error('Could not verify the APK backup checksum. No data was changed.')); }
+    });
+  }
+
+  function restoreAndroidStorageSnapshot(backup) {
+    return verifyAndroidStorageSnapshot(backup).then(function (valid) {
+      if (!confirm('Restore this Android APK backup? It will replace all DMoney profiles and financial records on this website. Your current website data will be replaced. Continue?')) return false;
+      var saved = {}, preserve = ['dmoney.drive.clientId', 'dmoney.drive.auto'];
+      for (var i = 0; i < localStorage.length; i++) {
+        var k = localStorage.key(i);
+        saved[k] = localStorage.getItem(k);
+      }
+      var preserved = {};
+      preserve.forEach(function (k) { preserved[k] = localStorage.getItem(k); });
+      try {
+        localStorage.clear();
+        Object.keys(valid.entries).forEach(function (k) {
+          if (preserve.indexOf(k) >= 0) return;
+          localStorage.setItem(k, valid.entries[k]);
+        });
+        preserve.forEach(function (k) { if (preserved[k] !== null) localStorage.setItem(k, preserved[k]); });
+      } catch (err) {
+        try {
+          localStorage.clear();
+          Object.keys(saved).forEach(function (k) { localStorage.setItem(k, saved[k]); });
+        } catch (rollbackError) { }
+        throw new Error('Browser storage could not accept this backup. The previous data was restored where possible.');
+      }
+      try { sessionStorage.clear(); } catch (e) { }
+      alert('Android APK backup restored. DMoney will reload with the restored data.');
+      window.location.reload();
+      return true;
+    });
+  }
+
   var WBT = {
     openAnalysis:function(){state.tab='analysis';state.view='goalsList';state.activeGoalId=null;state.activeCommitmentId=null;state.goalsSubtab=(state.goalsSubtab||'financial');state.showTxForm=false;state.utility='';state.showMenu=false;state.showSearch=false;state.showAccountPicker=false;render();},
     goHome: function () { state.tab='transactions'; state.view='log'; state.period='month'; state.periodValue=monthOf(todayStr()); state.activeGoalId=null; state.activeCommitmentId=null; state.showMenu=false; state.showSearch=false; state.showAccountPicker=false; state.showCarryYearPicker=false; state.utility=''; state.showTxForm=false; render(); },
@@ -2684,6 +2772,10 @@
       reader.onload = function (e) {
         try {
           var data = JSON.parse(e.target.result);
+          if (data && data.format === 'dmoney-web-storage') {
+            restoreAndroidStorageSnapshot(data).catch(function (err) { alert('APK backup restore failed: ' + err.message); });
+            return;
+          }
           var newProfiles, newActiveId;
           if (Array.isArray(data.profiles) && data.profiles.length) {
             newProfiles = data.profiles;
@@ -2752,7 +2844,8 @@
       return { app: 'DMoney', version: '2.2', backupType: 'google-drive', exportedAt: new Date().toISOString(), profiles: JSON.parse(JSON.stringify(state.profiles)), activeProfileId: state.activeProfileId };
     },
     restoreCloudBackup: function (backup) {
-      if (!backup || backup.app !== 'DMoney' || !Array.isArray(backup.profiles) || !backup.profiles.length) throw new Error('This is not a compatible DMoney backup.');
+      if (backup && backup.format === 'dmoney-web-storage') return restoreAndroidStorageSnapshot(backup);
+      if (!backup || !Array.isArray(backup.profiles) || !backup.profiles.length || (backup.app && backup.app !== 'DMoney')) throw new Error('This is not a compatible DMoney backup.');
       if (!confirm('Restore this backup? It will replace all profiles and financial records on this device.')) return false;
       state.profiles = JSON.parse(JSON.stringify(backup.profiles));
       var activeId = backup.activeProfileId && state.profiles.some(function (p) { return p.id === backup.activeProfileId; }) ? backup.activeProfileId : state.profiles[0].id;
@@ -3110,14 +3203,15 @@ function gis(){return new Promise(function(y,n){if(window.google&&google.account
 function token(prompt){return gis().then(function(){if(!cid())throw Error('Enter Google OAuth Web Client ID first.');return new Promise(function(y,n){google.accounts.oauth2.initTokenClient({client_id:cid(),scope:'https://www.googleapis.com/auth/drive.file',callback:function(r){if(r&&r.access_token){T=r.access_token;y(T);}else n(Error(r.error_description||r.error||'Sign-in cancelled'));},error_callback:function(e){n(Error(e.message||'Sign-in window blocked'));}}).requestAccessToken({prompt:prompt?'consent':''});});});}
 function api(u,o){o=o||{};o.headers=Object.assign({},o.headers||{},{Authorization:'Bearer '+T});return fetch(u,o).then(function(r){if(!r.ok)return r.text().then(function(t){var m='Drive error '+r.status;try{m=JSON.parse(t).error.message||m;}catch(e){}throw Error(m);});return r.json();});}
 function hist(){var e=document.getElementById('dmoneyDriveHistory');if(!e)return;e.innerHTML='Loading…';return api('https://www.googleapis.com/drive/v3/files?q='+encodeURIComponent("name contains 'dmoney-backup-' and trashed = false")+'&orderBy=createdTime desc&pageSize=20&fields=files(id,name,createdTime,size)').then(function(d){if(!document.getElementById('dmoneyDriveHistory'))return;var a=(d.files||[]).filter(function(f){return /^dmoney-backup-.*\.json$/i.test(f.name||'');});e.innerHTML=a.length?a.map(function(f){return '<div class="dmoney-drive-backup-row"><div class="meta"><b>'+esc(f.createdTime?new Date(f.createdTime).toLocaleString():'Date unavailable')+'</b><br>'+esc(f.name)+' · '+esc(f.size?Math.max(1,Math.round(f.size/1024))+' KB':'JSON')+'</div><button class="btn btn-outline" style="width:auto;margin:0;padding:7px" onclick="window.dmoneyRestoreDriveBackup(\''+esc(f.id)+'\')">Restore</button></div>';}).join(''):'<div class="empty-note">No backups yet. Select Back up now.</div>';}).catch(function(e){var el=document.getElementById('dmoneyDriveHistory');if(el)el.textContent='History error: '+e.message;});}
-function panel(){var old=document.getElementById(O);if(old)old.remove();document.body.insertAdjacentHTML('beforeend','<div class="dmoney-drive-overlay" id="'+O+'" onclick="if(event.target===this)window.dmoneyCloseDriveBackup()"><section class="dmoney-drive-panel" role="dialog" aria-modal="true"><div class="dmoney-drive-head"><div><div class="dmoney-drive-title">☁ Google Drive Backup</div><div class="dmoney-drive-note">DMoney 2.2 · backup and restore</div></div><button class="header-icon" onclick="window.dmoneyCloseDriveBackup()">×</button></div><div class="dmoney-drive-status" id="dmoneyDriveStatus">'+(T?'Connected to Google Drive':cid()?'Client ID saved · connect Drive':'Not connected')+'</div><label style="font-size:12px">Google OAuth Web Client ID</label><input id="dmoneyDriveClientId" value="'+esc(cid())+'" placeholder="Paste Google OAuth Web Client ID"><div class="dmoney-drive-note">Create a Google OAuth Web client, add https://dmoneyapp.github.io as an authorised JavaScript origin, and enable Google Drive API. Client ID stays in this browser.</div><button class="btn btn-green" style="width:100%" onclick="window.dmoneySaveDriveClient()">Save Client ID</button><button class="btn btn-green" style="width:100%" onclick="window.dmoneyConnectDrive()">Connect Google Drive</button><button class="btn btn-gold" style="width:100%" onclick="window.dmoneyBackupDriveNow()">⬆ Back up now</button><label class="check" style="margin:5px 0 10px"><input type="checkbox" style="width:auto" '+(auto()?'checked':'')+' onchange="window.dmoneyToggleDriveAuto(this.checked)"> Automatic backup while DMoney is open</label><div class="dmoney-drive-note">Automatic backups run after changes while this app is open and connected; not while Chrome is closed or the device sleeps.</div><div class="backup-section-title">Dated backup history</div><div class="dmoney-drive-history" id="dmoneyDriveHistory">Connect Drive to view backups.</div><button class="btn btn-outline" style="width:100%" onclick="window.dmoneyRefreshDriveHistory()">↻ Refresh history</button><button class="btn btn-cancel" style="width:100%" onclick="window.dmoneyDisconnectDrive()">Disconnect Google Drive</button></section></div>');if(T)hist();}
+function panel(){var old=document.getElementById(O);if(old)old.remove();document.body.insertAdjacentHTML('beforeend','<div class="dmoney-drive-overlay" id="'+O+'" onclick="if(event.target===this)window.dmoneyCloseDriveBackup()"><section class="dmoney-drive-panel" role="dialog" aria-modal="true"><div class="dmoney-drive-head"><div><div class="dmoney-drive-title">☁ Google Drive Backup</div><div class="dmoney-drive-note">DMoney 2.2 · backup and restore</div></div><button class="header-icon" onclick="window.dmoneyCloseDriveBackup()">×</button></div><div class="dmoney-drive-status" id="dmoneyDriveStatus">'+(T?'Connected to Google Drive':cid()?'Client ID saved · connect Drive':'Not connected')+'</div><label style="font-size:12px">Google OAuth Web Client ID</label><input id="dmoneyDriveClientId" value="'+esc(cid())+'" placeholder="Paste Google OAuth Web Client ID"><div class="dmoney-drive-note">Create a Google OAuth Web client, add https://dmoneyapp.github.io as an authorised JavaScript origin, and enable Google Drive API. Client ID stays in this browser.</div><button class="btn btn-green" style="width:100%" onclick="window.dmoneySaveDriveClient()">Save Client ID</button><button class="btn btn-green" style="width:100%" onclick="window.dmoneyConnectDrive()">Connect Google Drive</button><button class="btn btn-gold" style="width:100%" onclick="window.dmoneyBackupDriveNow()">⬆ Back up now</button><button class="btn btn-outline" style="width:100%" onclick="window.dmoneyRestoreLatestDriveBackup()">↻ Restore from Google Drive (APK backup)</button><button class="btn btn-outline" style="width:100%" onclick="document.getElementById(\'dmoneyApkBackupFile\').click()">📂 Restore APK backup JSON (.json)</button><input id="dmoneyApkBackupFile" type="file" accept="application/json,.json" style="display:none" onchange="window.WBT.handleImportFile(this)"><label class="check" style="margin:5px 0 10px"><input type="checkbox" style="width:auto" '+(auto()?'checked':'')+' onchange="window.dmoneyToggleDriveAuto(this.checked)"> Automatic backup while DMoney is open</label><div class="dmoney-drive-note">Automatic backups run after changes while this app is open and connected; not while Chrome is closed or the device sleeps.</div><div class="backup-section-title">Dated backup history</div><div class="dmoney-drive-history" id="dmoneyDriveHistory">Connect Drive to view backups.</div><button class="btn btn-outline" style="width:100%" onclick="window.dmoneyRefreshDriveHistory()">↻ Refresh history</button><button class="btn btn-cancel" style="width:100%" onclick="window.dmoneyDisconnectDrive()">Disconnect Google Drive</button></section></div>');if(T)hist();}
 window.dmoneyOpenDriveBackup=panel;window.dmoneyCloseDriveBackup=function(){var e=document.getElementById(O);if(e)e.remove();};
 window.dmoneySaveDriveClient=function(){var e=document.getElementById('dmoneyDriveClientId'),v=(e&&e.value||'').trim();if(!/^[^\s]+\.apps\.googleusercontent\.com$/.test(v)){stat('Enter a valid Google OAuth Web Client ID.');return;}localStorage.setItem(CK,v);stat('Client ID saved. Connect Google Drive next.');};
 window.dmoneyConnectDrive=function(){window.dmoneySaveDriveClient();if(!cid())return;stat('Opening Google sign-in…');token(true).then(function(){stat('Connected to Google Drive.');hist();}).catch(function(e){stat('Connection failed: '+e.message);});};
 window.dmoneyDisconnectDrive=function(){T=null;stat('Disconnected. Reconnect to back up or restore.');};
 window.dmoneyRefreshDriveHistory=function(){if(!T){stat('Connect Google Drive first.');return;}hist();};
 window.dmoneyBackupDriveNow=function(){if(B)return;var w=window.WBT,p=w&&w.getCloudBackupPayload?w.getCloudBackupPayload():null;if(!p){stat('DMoney backup is not ready.');return;}B=true;stat('Creating dated backup…');(T?Promise.resolve(T):token(false)).then(function(){var name='dmoney-backup-'+new Date().toISOString().replace(/[:.]/g,'-')+'.json';return api('https://www.googleapis.com/drive/v3/files?fields=id,name,createdTime','POST',{headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,mimeType:'application/json',appProperties:{dmoneyBackup:'true'}})}).then(function(f){return fetch('https://www.googleapis.com/upload/drive/v3/files/'+encodeURIComponent(f.id)+'?uploadType=media',{method:'PATCH',headers:{Authorization:'Bearer '+T,'Content-Type':'application/json'},body:JSON.stringify(p)}).then(function(r){if(!r.ok)throw Error('Upload failed HTTP '+r.status);return f;});});}).then(function(){L=Date.now();stat('Backup successful · '+new Date().toLocaleString());return hist();}).catch(function(e){stat('Backup failed: '+e.message);}).finally(function(){B=false;});};
-window.dmoneyRestoreDriveBackup=function(id){if(!T){stat('Connect Google Drive first.');return;}stat('Downloading backup…');api('https://www.googleapis.com/drive/v3/files/'+encodeURIComponent(id)+'?alt=media').then(function(d){if(!d||!Array.isArray(d.profiles)||!d.profiles.length)throw Error('Not a compatible full DMoney backup.');if(window.WBT&&WBT.restoreCloudBackup)WBT.restoreCloudBackup(d);window.dmoneyCloseDriveBackup();}).catch(function(e){stat('Restore failed: '+e.message);});};
+window.dmoneyRestoreDriveBackup=function(id){if(!T){stat('Connect Google Drive first.');return;}stat('Downloading backup…');api('https://www.googleapis.com/drive/v3/files/'+encodeURIComponent(id)+'?alt=media').then(function(d){if(!window.WBT||!WBT.restoreCloudBackup)throw Error('DMoney restore is not available.');return Promise.resolve(WBT.restoreCloudBackup(d));}).then(function(ok){if(ok){stat('Backup restored successfully.');window.dmoneyCloseDriveBackup();}else stat('Restore cancelled.');}).catch(function(e){stat('Restore failed: '+e.message);});};
+window.dmoneyRestoreLatestDriveBackup=function(){if(!T){stat('Connect Google Drive first.');return;}stat('Finding the latest Google Drive backup…');function list(q){return api('https://www.googleapis.com/drive/v3/files?q='+encodeURIComponent(q)+'&orderBy=modifiedTime%20desc&pageSize=100&fields=files(id,name,createdTime,modifiedTime,size,parents)&spaces=drive').then(function(d){return d.files||[];});}function globalList(){return list("name contains 'dmoney-backup-' and trashed=false");}list("name='DMoney Backups' and mimeType='application/vnd.google-apps.folder' and trashed=false").then(function(folders){if(!folders.length)return globalList();return list("'"+folders[0].id+"' in parents and name contains 'dmoney-backup-' and trashed=false").then(function(files){return files.length?files:globalList();});}).then(function(files){files=files.filter(function(f){return /^dmoney-backup-.*\.json$/i.test(f.name||'');}).sort(function(a,b){return String(b.modifiedTime||b.createdTime||'').localeCompare(String(a.modifiedTime||a.createdTime||''));});if(!files.length)throw Error('No DMoney backup JSON was found in the connected Google account.');function attempt(i,lastError){if(i>=files.length)throw Error('No compatible backup could be restored. '+(lastError&&lastError.message?lastError.message:''));return api('https://www.googleapis.com/drive/v3/files/'+encodeURIComponent(files[i].id)+'?alt=media').then(function(d){if(!window.WBT||!WBT.restoreCloudBackup)throw Error('DMoney restore is not available.');return Promise.resolve(WBT.restoreCloudBackup(d)).then(function(ok){if(ok){stat('Restored '+files[i].name);window.dmoneyCloseDriveBackup();}else stat('Restore cancelled.');});}).catch(function(e){return attempt(i+1,e);});}return attempt(0,null);}).catch(function(e){stat('Google Drive restore failed: '+e.message);});};
 window.dmoneyToggleDriveAuto=function(v){localStorage.setItem(AK,v?'1':'0');stat(v?'Automatic backup enabled while app is open.':'Automatic backup disabled.');if(v&&T)window.dmoneyBackupDriveNow();};
 window.scheduleDriveAutoBackup=function(){if(!auto()||!T||B)return;if(Q)clearTimeout(Q);Q=setTimeout(function(){if(auto()&&T&&Date.now()-L>=60000)window.dmoneyBackupDriveNow();},5000);};
 })();
