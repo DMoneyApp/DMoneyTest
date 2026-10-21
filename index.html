@@ -2272,7 +2272,7 @@
   function restoreAndroidStorageSnapshot(backup) {
     return verifyAndroidStorageSnapshot(backup).then(function (valid) {
       if (!confirm('Restore this Android APK backup? It will replace all DMoney profiles and financial records on this website. Your current website data will be replaced. Continue?')) return false;
-      var saved = {}, preserve = ['dmoney.drive.clientId', 'dmoney.drive.auto'];
+      var saved = {}, preserve = ['dmoney.drive.clientId', 'dmoney.drive.auto', 'dmoney.drive.remembered'];
       for (var i = 0; i < localStorage.length; i++) {
         var k = localStorage.key(i);
         saved[k] = localStorage.getItem(k);
